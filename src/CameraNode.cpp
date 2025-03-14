@@ -1,636 +1,791 @@
-#include "ParameterHandler.hpp"
-#include "format_mapping.hpp"
-#include "pretty_print.hpp"
-#include <algorithm>
-#include <camera_info_manager/camera_info_manager.hpp>
-#include <cassert>
-#include <cctype>
-#include <cerrno>
-#include <cstdint>
-#include <cstring>
-#if __has_include(<cv_bridge/cv_bridge.hpp>)
-#include <cv_bridge/cv_bridge.hpp>
-#elif __has_include(<cv_bridge/cv_bridge.h>)
-#include <cv_bridge/cv_bridge.h>
-#endif
-#include <atomic>
-#include <iostream>
-#include <libcamera/base/shared_fd.h>
-#include <libcamera/base/signal.h>
-#include <libcamera/base/span.h>
-#include <libcamera/camera.h>
-#include <libcamera/camera_manager.h>
-#include <libcamera/control_ids.h>
-#include <libcamera/formats.h>
-#include <libcamera/framebuffer.h>
-#include <libcamera/framebuffer_allocator.h>
-#include <libcamera/geometry.h>
-#include <libcamera/pixel_format.h>
-#include <libcamera/property_ids.h>
-#include <libcamera/request.h>
-#include <libcamera/stream.h>
+#include <rclcpp/rclcpp.hpp>
 #include <memory>
-#include <opencv2/core/mat.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <optional>
-#include <rcl/context.h>
-#include <rcl_interfaces/msg/floating_point_range.hpp>
-#include <rcl_interfaces/msg/integer_range.hpp>
-#include <rcl_interfaces/msg/parameter_descriptor.hpp>
-#include <rcl_interfaces/msg/parameter_type.hpp>
-#include <rcl_interfaces/msg/set_parameters_result.hpp>
-#include <rclcpp/logging.hpp>
-#include <rclcpp/node.hpp>
-#include <rclcpp/node_interfaces/node_parameters_interface.hpp>
-#include <rclcpp/parameter.hpp>
-#include <rclcpp/parameter_value.hpp>
-#include <rclcpp/publisher.hpp>
-#include <rclcpp/time.hpp>
-#include <rclcpp_components/register_node_macro.hpp>
-#include <sensor_msgs/image_encodings.hpp>
-#include <sensor_msgs/msg/camera_info.hpp>
-#include <sensor_msgs/msg/compressed_image.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <std_msgs/msg/header.hpp>
-#include <stdexcept>
 #include <string>
-#include <sys/mman.h>
-#include <thread>
-#include <unordered_map>
-#include <utility>
-#include <vector>
-
-namespace rclcpp
-{
-class NodeOptions;
-}
-
+#include <camera_info_manager/camera_info_manager.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include "WbCameraHandler.h"
 
 namespace camera
 {
-class CameraNode : public rclcpp::Node
+
+class MinimalCameraNode : public rclcpp::Node
 {
 public:
-  explicit CameraNode(const rclcpp::NodeOptions &options);
+  explicit MinimalCameraNode(const rclcpp::NodeOptions &options)
+      : Node("camera", options),
+        cim(this)
+  {
+    RCLCPP_INFO(get_logger(), "Starting MinimalCameraNode initialization...");
 
-  ~CameraNode();
+    // Parameters
+    const uint32_t width = declare_parameter<int64_t>("width", 1280);
+    const uint32_t height = declare_parameter<int64_t>("height", 720);
+    const std::string camera_id = declare_parameter<std::string>("camera", "");
+    const bool flip_image = declare_parameter<bool>("flip_image", true);
+    const bool auto_exposure = declare_parameter<bool>("auto_exposure", false);
+    const uint32_t exposure_time_us = declare_parameter<int64_t>("exposure_time_us", 90000);
+
+    RCLCPP_INFO(get_logger(), "Parameters loaded - width: %u, height: %u, camera_id: '%s', flip: %s, auto_exposure: %s, exposure_time: %u μs",
+                width, height, camera_id.c_str(), flip_image ? "true" : "false",
+                auto_exposure ? "true" : "false", exposure_time_us);
+
+    // Set up path to shared timestamp file
+    const char *user_name = getlogin();
+    if (!user_name) {
+      RCLCPP_ERROR(get_logger(), "Failed to get username for timeshare path");
+      throw std::runtime_error("Failed to get username");
+    }
+    std::string timeshare_path = "/home/" + std::string(user_name) + "/timeshare";
+    RCLCPP_INFO(get_logger(), "Using timeshare path: %s", timeshare_path.c_str());
+
+    // Create publishers
+    pub_image = create_publisher<sensor_msgs::msg::Image>("~/image_raw", 10);
+    pub_ci = create_publisher<sensor_msgs::msg::CameraInfo>("~/camera_info", 10);
+
+    RCLCPP_INFO(get_logger(), "Publishing to topics:");
+    RCLCPP_INFO(get_logger(), "  - %s", pub_image->get_topic_name());
+    RCLCPP_INFO(get_logger(), "  - %s", pub_ci->get_topic_name());
+
+    RCLCPP_INFO(get_logger(), "Creating WbCameraHandler...");
+    try {
+      // Initialize camera handler
+      camera_handler = std::make_unique<WbCameraHandler>();
+
+      RCLCPP_INFO(get_logger(), "Initializing camera...");
+      if (!camera_handler->initialize(camera_id, width, height)) {
+        RCLCPP_ERROR(get_logger(), "Failed to initialize camera");
+        throw std::runtime_error("Failed to initialize camera");
+      }
+      RCLCPP_INFO(get_logger(), "Camera initialized successfully");
+
+      // Set exposure settings
+      RCLCPP_INFO(get_logger(), "Setting camera exposure...");
+      camera_handler->setExposure(auto_exposure, exposure_time_us);
+
+      // Set up hardware synchronization
+      RCLCPP_INFO(get_logger(), "Setting up hardware sync...");
+      bool sync_result = camera_handler->setupHardwareSync(timeshare_path);
+      RCLCPP_INFO(get_logger(), "Hardware sync setup %s", sync_result ? "successful" : "failed (will use system time)");
+
+      // Set up camera info manager
+      const std::string camera_name = camera_handler->getCameraName();
+      RCLCPP_INFO(get_logger(), "Using camera name: %s", camera_name.c_str());
+      cim.setCameraName(camera_name);
+
+      const std::string &camera_info_url = declare_parameter<std::string>("camera_info_url", "");
+      RCLCPP_INFO(get_logger(), "Loading camera calibration from URL: %s",
+                  camera_info_url.empty() ? "(empty)" : camera_info_url.c_str());
+      if (!cim.loadCameraInfo(camera_info_url)) {
+        RCLCPP_WARN(get_logger(), "Failed to load camera calibration from URL");
+      }
+
+      // Set up the frame callback
+      RCLCPP_INFO(get_logger(), "Setting up frame callback...");
+      auto frame_callback = [this, flip_image](const WbCameraHandler::FrameData &frame_data) {
+        handleFrame(frame_data, flip_image);
+      };
+
+      // Start the camera
+      RCLCPP_INFO(get_logger(), "Starting camera...");
+      if (!camera_handler->start(frame_callback)) {
+        RCLCPP_ERROR(get_logger(), "Failed to start camera");
+        throw std::runtime_error("Failed to start camera");
+      }
+      RCLCPP_INFO(get_logger(), "Camera started successfully");
+
+      // Set up statistics timer
+      RCLCPP_INFO(get_logger(), "Setting up statistics timer...");
+
+      RCLCPP_INFO(get_logger(), "MinimalCameraNode initialization complete");
+    }
+    catch (const std::exception &e) {
+      RCLCPP_ERROR(get_logger(), "Exception during camera initialization: %s", e.what());
+      throw;
+    }
+    catch (...) {
+      RCLCPP_ERROR(get_logger(), "Unknown exception during camera initialization");
+      throw;
+    }
+  }
+
+  ~MinimalCameraNode()
+  {
+    RCLCPP_INFO(get_logger(), "Shutting down MinimalCameraNode...");
+    if (camera_handler) {
+      RCLCPP_INFO(get_logger(), "Stopping camera...");
+      camera_handler->stop();
+      RCLCPP_INFO(get_logger(), "Camera stopped");
+    }
+    RCLCPP_INFO(get_logger(), "MinimalCameraNode shutdown complete");
+  }
 
 private:
-  libcamera::CameraManager camera_manager;
-  std::shared_ptr<libcamera::Camera> camera;
-  libcamera::Stream *stream;
-  std::shared_ptr<libcamera::FrameBufferAllocator> allocator;
-  std::vector<std::unique_ptr<libcamera::Request>> requests;
-  std::vector<std::thread> request_threads;
-  std::unordered_map<const libcamera::Request *, std::mutex> request_mutexes;
-  std::unordered_map<const libcamera::Request *, std::condition_variable> request_condvars;
-  std::atomic<bool> running;
+  // Camera handler
+  std::unique_ptr<WbCameraHandler> camera_handler;
 
-  struct buffer_info_t
-  {
-    void *data;
-    size_t size;
-  };
-  std::unordered_map<const libcamera::FrameBuffer *, buffer_info_t> buffer_info;
-
-  // timestamp offset (ns) from camera time to system time
-  int64_t time_offset = 0;
-
+  // Publishers
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image;
-  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_image_compressed;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_ci;
 
+  // Camera info manager
   camera_info_manager::CameraInfoManager cim;
 
-  ParameterHandler parameter_handler;
-
-#ifdef RCLCPP_HAS_PARAM_EXT_CB
-  // use new "post_set" callback to apply parameters
-  PostSetParametersCallbackHandle::SharedPtr param_cb_change;
-#else
-  OnSetParametersCallbackHandle::SharedPtr param_cb_change;
-#endif
-
-  // compression quality parameter
-  std::atomic_uint8_t jpeg_quality;
+  // Timer for periodic stats printing
+  rclcpp::TimerBase::SharedPtr stats_timer;
 
   void
-  requestComplete(libcamera::Request *const request);
-
-  void
-  process(libcamera::Request *const request);
-
-  void
-  postParameterChange(const std::vector<rclcpp::Parameter> &parameters);
-
-#ifndef RCLCPP_HAS_PARAM_EXT_CB
-  rcl_interfaces::msg::SetParametersResult
-  onParameterChange(const std::vector<rclcpp::Parameter> &parameters);
-#endif
-};
-
-RCLCPP_COMPONENTS_REGISTER_NODE(camera::CameraNode)
-
-
-libcamera::StreamRole
-get_role(const std::string &role)
-{
-  static const std::unordered_map<std::string, libcamera::StreamRole> roles_map = {
-    {"raw", libcamera::StreamRole::Raw},
-    {"still", libcamera::StreamRole::StillCapture},
-    {"video", libcamera::StreamRole::VideoRecording},
-    {"viewfinder", libcamera::StreamRole::Viewfinder},
-  };
-
-  try {
-    return roles_map.at(role);
-  }
-  catch (const std::out_of_range &) {
-    throw std::runtime_error("invalid stream role: \"" + role + "\"");
-  }
-}
-
-
-// The following function "compressImageMsg" is adapted from "CvImage::toCompressedImageMsg"
-// (https://github.com/ros-perception/vision_opencv/blob/066793a23e5d06d76c78ca3d69824a501c3554fd/cv_bridge/src/cv_bridge.cpp#L512-L535)
-// and covered by the BSD-3-Clause licence.
-void
-compressImageMsg(const sensor_msgs::msg::Image &source,
-                 sensor_msgs::msg::CompressedImage &destination,
-                 const std::vector<int> &params = std::vector<int>())
-{
-  namespace enc = sensor_msgs::image_encodings;
-
-  std::shared_ptr<CameraNode> tracked_object;
-  cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(source, tracked_object);
-
-  destination.header = source.header;
-  cv::Mat image;
-  if (cv_ptr->encoding == enc::BGR8 || cv_ptr->encoding == enc::BGRA8 ||
-      cv_ptr->encoding == enc::MONO8 || cv_ptr->encoding == enc::MONO16)
+  handleFrame(const WbCameraHandler::FrameData &frame_data, bool flip_image)
   {
-    image = cv_ptr->image;
-  }
-  else {
-    cv_bridge::CvImagePtr tempThis = std::make_shared<cv_bridge::CvImage>(*cv_ptr);
-    cv_bridge::CvImagePtr temp;
-    if (enc::hasAlpha(cv_ptr->encoding)) {
-      temp = cv_bridge::cvtColor(tempThis, enc::BGRA8);
+    // Log the first few frames for debugging
+    static int frame_debug_count = 0;
+    if (frame_debug_count < 5) {
+      RCLCPP_INFO(get_logger(), "Received frame %d: %dx%d, HW timestamp: %ld (valid: %s), camera timestamp: %ld",
+                  frame_debug_count, frame_data.width, frame_data.height,
+                  frame_data.hw_timestamp_ns, frame_data.hw_timestamp_valid ? "yes" : "no",
+                  frame_data.camera_timestamp_ns);
+      frame_debug_count++;
+    }
+
+    // Check if there are any subscribers before processing
+    bool has_raw_subscribers = pub_image->get_subscription_count() > 0;
+    bool has_camera_info_subscribers = pub_ci->get_subscription_count() > 0;
+
+    if (!has_raw_subscribers && !has_camera_info_subscribers) {
+      // Periodically log when no subscribers
+      static int no_sub_log_count = 0;
+      if (no_sub_log_count++ % 100 == 0) {
+        RCLCPP_INFO(get_logger(), "No subscribers to image or camera_info topics");
+      }
+      return;
+    }
+
+    // Prepare header and timestamp
+    std_msgs::msg::Header hdr;
+    hdr.frame_id = "camera";
+
+    // Format the timestamp properly for ROS messages
+    if (frame_data.hw_timestamp_valid) {
+      // Convert to ROS time:
+      // The LiDAR puts nanoseconds since Unix epoch in hw_timestamp_ns
+      // This is exactly what ROS2 expects for its time representation
+      hdr.stamp.sec = frame_data.hw_timestamp_ns / 1000000000;
+      hdr.stamp.nanosec = frame_data.hw_timestamp_ns % 1000000000;
+    }
+    else if (frame_data.camera_timestamp_ns > 0) {
+      // Fall back to camera timestamp if available
+      hdr.stamp.sec = frame_data.camera_timestamp_ns / 1000000000;
+      hdr.stamp.nanosec = frame_data.camera_timestamp_ns % 1000000000;
     }
     else {
-      temp = cv_bridge::cvtColor(tempThis, enc::BGR8);
-    }
-    image = temp->image;
-  }
-
-  destination.format = "jpg";
-  cv::imencode(".jpg", image, destination.data, params);
-}
-
-
-CameraNode::CameraNode(const rclcpp::NodeOptions &options)
-    : Node("camera", options),
-      cim(this),
-      parameter_handler(this),
-      param_cb_change(
-#ifdef RCLCPP_HAS_PARAM_EXT_CB
-        add_post_set_parameters_callback(std::bind(&CameraNode::postParameterChange, this, std::placeholders::_1))
-#else
-        add_on_set_parameters_callback(std::bind(&CameraNode::onParameterChange, this, std::placeholders::_1))
-#endif
-      )
-{
-  // pixel format
-  rcl_interfaces::msg::ParameterDescriptor param_descr_format;
-  param_descr_format.description = "pixel format of streaming buffer";
-  param_descr_format.read_only = true;
-  const std::string &format = declare_parameter<std::string>("format", {}, param_descr_format);
-
-  // stream role
-  rcl_interfaces::msg::ParameterDescriptor param_descr_role;
-  param_descr_role.description = "stream role";
-  param_descr_role.additional_constraints = "one of {raw, still, video, viewfinder}";
-  param_descr_role.read_only = true;
-  const libcamera::StreamRole role =
-    get_role(declare_parameter<std::string>("role", "viewfinder", param_descr_role));
-
-  // image dimensions
-  rcl_interfaces::msg::ParameterDescriptor param_descr_ro;
-  param_descr_ro.read_only = true;
-  const uint32_t w = declare_parameter<int64_t>("width", {}, param_descr_ro);
-  const uint32_t h = declare_parameter<int64_t>("height", {}, param_descr_ro);
-  const libcamera::Size size {w, h};
-
-  // camera info file url
-  rcl_interfaces::msg::ParameterDescriptor param_descr_camera_info_url;
-  param_descr_camera_info_url.description = "camera calibration info file url";
-  param_descr_camera_info_url.read_only = true;
-
-  // camera ID
-  declare_parameter("camera", rclcpp::ParameterValue {}, param_descr_ro.set__dynamic_typing(true));
-
-  // we cannot control the compression rate of the libcamera MJPEG stream
-  // ignore "jpeg_quality" parameter for MJPEG streams
-  if (libcamera::PixelFormat::fromString(format) != libcamera::formats::MJPEG) {
-    rcl_interfaces::msg::ParameterDescriptor jpeg_quality_description;
-    jpeg_quality_description.name = "jpeg_quality";
-    jpeg_quality_description.type = rcl_interfaces::msg::ParameterType::PARAMETER_INTEGER;
-    jpeg_quality_description.description = "Image quality for JPEG format";
-    jpeg_quality_description.read_only = false;
-    rcl_interfaces::msg::IntegerRange jpeg_range;
-    jpeg_range.from_value = 1;
-    jpeg_range.to_value = 100;
-    jpeg_range.step = 1;
-    jpeg_quality_description.integer_range = {jpeg_range};
-    // default to 95
-    jpeg_quality = declare_parameter<uint8_t>("jpeg_quality", 95, jpeg_quality_description);
-  }
-
-  // publisher for raw and compressed image
-  pub_image = this->create_publisher<sensor_msgs::msg::Image>("~/image_raw", 1);
-  pub_image_compressed =
-    this->create_publisher<sensor_msgs::msg::CompressedImage>("~/image_raw/compressed", 1);
-  pub_ci = this->create_publisher<sensor_msgs::msg::CameraInfo>("~/camera_info", 1);
-
-  // start camera manager and check for cameras
-  camera_manager.start();
-  if (camera_manager.cameras().empty())
-    throw std::runtime_error("no cameras available");
-
-  // get the camera
-  switch (get_parameter("camera").get_type()) {
-  case rclcpp::ParameterType::PARAMETER_NOT_SET:
-    // use first camera as default
-    camera = camera_manager.cameras().front();
-    RCLCPP_INFO_STREAM(get_logger(), camera_manager);
-    RCLCPP_WARN_STREAM(get_logger(),
-                       "no camera selected, using default: \"" << camera->id() << "\"");
-    RCLCPP_WARN_STREAM(get_logger(), "set parameter 'camera' to silence this warning");
-    break;
-  case rclcpp::ParameterType::PARAMETER_INTEGER:
-  {
-    const size_t id = get_parameter("camera").as_int();
-    if (id >= camera_manager.cameras().size()) {
-      RCLCPP_INFO_STREAM(get_logger(), camera_manager);
-      throw std::runtime_error("camera with id " + std::to_string(id) + " does not exist");
-    }
-    camera = camera_manager.cameras().at(id);
-    RCLCPP_DEBUG_STREAM(get_logger(), "found camera by id: " << id);
-  } break;
-  case rclcpp::ParameterType::PARAMETER_STRING:
-  {
-    const std::string name = get_parameter("camera").as_string();
-    camera = camera_manager.get(name);
-    if (!camera) {
-      RCLCPP_INFO_STREAM(get_logger(), camera_manager);
-      throw std::runtime_error("camera with name " + name + " does not exist");
-    }
-    RCLCPP_DEBUG_STREAM(get_logger(), "found camera by name: \"" << name << "\"");
-  } break;
-  default:
-    RCLCPP_ERROR_STREAM(get_logger(), "unsupported camera parameter type: "
-                                        << get_parameter("camera").get_type_name());
-    break;
-  }
-
-  if (!camera)
-    throw std::runtime_error("failed to find camera");
-
-  if (camera->acquire())
-    throw std::runtime_error("failed to acquire camera");
-
-  // configure camera stream
-  std::unique_ptr<libcamera::CameraConfiguration> cfg =
-    camera->generateConfiguration({role});
-
-  if (!cfg)
-    throw std::runtime_error("failed to generate configuration");
-
-  assert(cfg->size() == 1);
-  libcamera::StreamConfiguration &scfg = cfg->at(0);
-
-  // list all camera formats, including those not supported by the ROS message
-  RCLCPP_DEBUG_STREAM(get_logger(), "default " << role << " stream configuration: \"" << scfg.toString() << "\"");
-  RCLCPP_DEBUG_STREAM(get_logger(), scfg.formats());
-
-  // get common pixel formats that are supported by the camera and the node
-  const libcamera::StreamFormats stream_formats = get_common_stream_formats(scfg.formats());
-  const std::vector<libcamera::PixelFormat> common_fmt = stream_formats.pixelformats();
-
-  RCLCPP_INFO_STREAM(get_logger(), stream_formats);
-
-  if (common_fmt.empty())
-    throw std::runtime_error("camera does not provide any of the supported pixel formats");
-
-  if (format.empty()) {
-    // check that the default pixel format is supported by the ROS encoding
-    if (std::find(common_fmt.cbegin(), common_fmt.cend(), scfg.pixelFormat) == common_fmt.cend()) {
-      // auto select first common pixel format
-      RCLCPP_WARN_STREAM(get_logger(), "default pixel format (" << scfg.pixelFormat << ") not supported");
-      scfg.pixelFormat = common_fmt.front();
+      // Last resort is system time
+      hdr.stamp = this->now();
     }
 
-    RCLCPP_WARN_STREAM(get_logger(),
-                       "no pixel format selected, auto-selecting: \"" << scfg.pixelFormat << "\"");
-    RCLCPP_WARN_STREAM(get_logger(), "set parameter 'format' to silence this warning");
-  }
-  else {
-    // get pixel format from provided string
-    const libcamera::PixelFormat format_requested = libcamera::PixelFormat::fromString(format);
-    if (!format_requested.isValid()) {
-      throw std::runtime_error("invalid pixel format: \"" + format + "\"");
-    }
-    // check that the requested format is supported by camera and the node
-    if (std::find(common_fmt.begin(), common_fmt.end(), format_requested) == common_fmt.end()) {
-      throw std::runtime_error("unsupported pixel format \"" + format + "\"");
-    }
-    scfg.pixelFormat = format_requested;
-  }
-
-  RCLCPP_INFO_STREAM(get_logger(), list_format_sizes(scfg));
-
-  if (size.isNull()) {
-    RCLCPP_WARN_STREAM(get_logger(), "no dimensions selected, auto-selecting: \"" << scfg.size << "\"");
-    RCLCPP_WARN_STREAM(get_logger(), "set parameter 'width' or 'height' to silence this warning");
-  }
-  else {
-    scfg.size = size;
-  }
-
-  // store selected stream configuration
-  const libcamera::StreamConfiguration selected_scfg = scfg;
-
-  switch (cfg->validate()) {
-  case libcamera::CameraConfiguration::Valid:
-    break;
-  case libcamera::CameraConfiguration::Adjusted:
-    RCLCPP_WARN_STREAM(get_logger(), "stream configuration adjusted from \""
-                                       << selected_scfg.toString() << "\" to \"" << scfg.toString()
-                                       << "\"");
-    break;
-  case libcamera::CameraConfiguration::Invalid:
-    throw std::runtime_error("failed to validate stream configurations");
-    break;
-  }
-
-  switch (camera->configure(cfg.get())) {
-  case -ENODEV:
-    throw std::runtime_error("configure: camera has been disconnected from the system");
-  case -EACCES:
-    throw std::runtime_error("configure: camera is not in a state where it can be configured");
-  case -EINVAL:
-    throw std::runtime_error("configure: configuration \"" + scfg.toString() + "\" is not valid");
-  default:
-    RCLCPP_INFO_STREAM(get_logger(), "camera \"" << camera->id() << "\" configured with "
-                                                 << scfg.toString() << " stream");
-    break;
-  }
-
-  // format camera name for calibration file
-  const libcamera::ControlList &props = camera->properties();
-  std::string cname = camera->id() + '_' + scfg.size.toString();
-  const std::optional<std::string> model = props.get(libcamera::properties::Model);
-  if (model)
-    cname = model.value() + '_' + cname;
-
-  // clean camera name of non-alphanumeric characters
-  cname.erase(
-    std::remove_if(cname.begin(), cname.end(), [](const char &x) { return std::isspace(x); }),
-    cname.cend());
-  std::replace_if(
-    cname.begin(), cname.end(), [](const char &x) { return !std::isalnum(x); }, '_');
-
-  if (!cim.setCameraName(cname))
-    throw std::runtime_error("camera name must only contain alphanumeric characters");
-
-  const std::string &camera_info_url = declare_parameter<std::string>(
-    "camera_info_url", {}, param_descr_camera_info_url);
-  if (!cim.loadCameraInfo(camera_info_url)) {
-    if (!camera_info_url.empty()) {
-      RCLCPP_WARN_STREAM(get_logger(), "failed to load camera calibration info from provided URL, using default URL");
-      cim.loadCameraInfo({});
-    }
-  }
-
-  parameter_handler.declare(camera->controls());
-
-  // allocate stream buffers and create one request per buffer
-  stream = scfg.stream();
-
-  allocator = std::make_shared<libcamera::FrameBufferAllocator>(camera);
-  allocator->allocate(stream);
-
-  for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : allocator->buffers(stream)) {
-    std::unique_ptr<libcamera::Request> request = camera->createRequest();
-    if (!request)
-      throw std::runtime_error("Can't create request");
-
-    // multiple planes of the same buffer use the same file descriptor
-    size_t buffer_length = 0;
-    int fd = -1;
-    for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
-      if (plane.offset == libcamera::FrameBuffer::Plane::kInvalidOffset)
-        throw std::runtime_error("invalid offset");
-      buffer_length = std::max<size_t>(buffer_length, plane.offset + plane.length);
-      if (!plane.fd.isValid())
-        throw std::runtime_error("file descriptor is not valid");
-      if (fd == -1)
-        fd = plane.fd.get();
-      else if (fd != plane.fd.get())
-        throw std::runtime_error("plane file descriptors differ");
-    }
-
-    // memory-map the frame buffer planes
-    void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED)
-      throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
-    buffer_info[buffer.get()] = {data, buffer_length};
-
-    if (request->addBuffer(stream, buffer.get()) < 0)
-      throw std::runtime_error("Can't set buffer for request");
-
-    requests.push_back(std::move(request));
-  }
-
-  // create a processing thread per request
-  running = true;
-  for (const std::unique_ptr<libcamera::Request> &request : requests) {
-    // create mutexes in-place
-    request_mutexes[request.get()];
-    request_condvars[request.get()];
-    request_threads.emplace_back(&CameraNode::process, this, request.get());
-  }
-
-  // register callback
-  camera->requestCompleted.connect(this, &CameraNode::requestComplete);
-
-  // start camera with initial controls
-  if (camera->start(&parameter_handler.get_control_values()))
-    throw std::runtime_error("failed to start camera");
-
-  // queue all requests
-  for (std::unique_ptr<libcamera::Request> &request : requests)
-    camera->queueRequest(request.get());
-}
-
-CameraNode::~CameraNode()
-{
-  // stop request callbacks
-  for (std::unique_ptr<libcamera::Request> &request : requests)
-    camera->requestCompleted.disconnect(request.get());
-
-  // stop request processing threads
-  running = false;
-
-  // unlock all threads
-  for (auto &[req, condvar] : request_condvars)
-    condvar.notify_all();
-
-  // wait for all currently running threads to finish
-  for (std::thread &thread : request_threads)
-    thread.join();
-
-  // stop camera
-  if (camera->stop())
-    std::cerr << "failed to stop camera" << std::endl;
-  allocator->free(stream);
-  allocator.reset();
-  camera->release();
-  camera.reset();
-  camera_manager.stop();
-  for (const auto &e : buffer_info)
-    if (munmap(e.second.data, e.second.size) == -1)
-      std::cerr << "munmap failed: " << std::strerror(errno) << std::endl;
-}
-
-void
-CameraNode::requestComplete(libcamera::Request *const request)
-{
-  std::unique_lock lk(request_mutexes.at(request));
-  request_condvars.at(request).notify_one();
-}
-
-void
-CameraNode::process(libcamera::Request *const request)
-{
-  while (true) {
-    // block until request is available
-    std::unique_lock lk(request_mutexes.at(request));
-    request_condvars.at(request).wait(lk);
-
-    if (!running)
-      return;
-
-    if (request->status() == libcamera::Request::RequestComplete) {
-      assert(request->buffers().size() == 1);
-
-      // get the stream and buffer from the request
-      const libcamera::FrameBuffer *buffer = request->findBuffer(stream);
-      const libcamera::FrameMetadata &metadata = buffer->metadata();
-      size_t bytesused = 0;
-      for (const libcamera::FrameMetadata::Plane &plane : metadata.planes())
-        bytesused += plane.bytesused;
-
-      // set time offset once for accurate timing using the device time
-      if (time_offset == 0)
-        time_offset = this->now().nanoseconds() - metadata.timestamp;
-
-      // send image data
-      std_msgs::msg::Header hdr;
-      hdr.stamp = rclcpp::Time(time_offset + int64_t(metadata.timestamp));
-      hdr.frame_id = "camera";
-      const libcamera::StreamConfiguration &cfg = stream->configuration();
-
-      auto msg_img = std::make_unique<sensor_msgs::msg::Image>();
-      auto msg_img_compressed = std::make_unique<sensor_msgs::msg::CompressedImage>();
-
-      if (format_type(cfg.pixelFormat) == FormatType::RAW) {
-        // raw uncompressed image
-        assert(buffer_info[buffer].size == bytesused);
+    try {
+      // Publish raw image if there are subscribers
+      if (has_raw_subscribers) {
+        auto msg_img = std::make_unique<sensor_msgs::msg::Image>();
         msg_img->header = hdr;
-        msg_img->width = cfg.size.width;
-        msg_img->height = cfg.size.height;
-        msg_img->step = cfg.stride;
-        msg_img->encoding = get_ros_encoding(cfg.pixelFormat);
+        msg_img->width = frame_data.width;
+        msg_img->height = frame_data.height;
+        msg_img->step = frame_data.stride;
+        msg_img->encoding = "rgb8";
         msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
-        msg_img->data.resize(buffer_info[buffer].size);
-        memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
 
-        // compress to jpeg
-        if (pub_image_compressed->get_subscription_count()) {
-          try {
-            compressImageMsg(*msg_img, *msg_img_compressed,
-                             {cv::IMWRITE_JPEG_QUALITY, jpeg_quality});
-          }
-          catch (const cv_bridge::Exception &e) {
-            RCLCPP_ERROR_STREAM(get_logger(), e.what());
-          }
+        msg_img->data.resize(frame_data.size);
+        memcpy(msg_img->data.data(), frame_data.data, frame_data.size);
+
+        if (flip_image) {
+          WbCameraHandler::flipRGB888Image(msg_img->data.data(), frame_data.width,
+                                           frame_data.height, frame_data.stride);
         }
-      }
-      else if (format_type(cfg.pixelFormat) == FormatType::COMPRESSED) {
-        // compressed image
-        assert(bytesused < buffer_info[buffer].size);
-        msg_img_compressed->header = hdr;
-        msg_img_compressed->format = get_ros_encoding(cfg.pixelFormat);
-        msg_img_compressed->data.resize(bytesused);
-        memcpy(msg_img_compressed->data.data(), buffer_info[buffer].data, bytesused);
 
-        // decompress into raw rgb8 image
-        if (pub_image->get_subscription_count())
-          cv_bridge::toCvCopy(*msg_img_compressed, "rgb8")->toImageMsg(*msg_img);
-      }
-      else {
-        throw std::runtime_error("unsupported pixel format: " +
-                                 stream->configuration().pixelFormat.toString());
+        pub_image->publish(std::move(msg_img));
       }
 
-      pub_image->publish(std::move(msg_img));
-      pub_image_compressed->publish(std::move(msg_img_compressed));
-
-      sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
-      ci.header = hdr;
-      pub_ci->publish(ci);
+      // Publish camera info if there are subscribers
+      if (has_camera_info_subscribers) {
+        sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
+        ci.header = hdr;
+        pub_ci->publish(ci);
+      }
     }
-    else if (request->status() == libcamera::Request::RequestCancelled) {
-      RCLCPP_ERROR_STREAM(get_logger(), "request '" << request->toString() << "' cancelled");
-    }
-
-    // redeclare implicitly undeclared parameters
-    parameter_handler.redeclare();
-
-    // queue the request again for the next frame and update controls
-    request->reuse(libcamera::Request::ReuseBuffers);
-    parameter_handler.move_control_values(request->controls());
-    camera->queueRequest(request);
-
-    for (const auto &[id, value] : request->controls()) {
-      const std::string &name = libcamera::controls::controls.at(id)->name();
-      RCLCPP_DEBUG_STREAM(get_logger(), "applied control '" << name << "': " << (value.isNone() ? "NONE" : value.toString()));
+    catch (const std::exception &e) {
+      RCLCPP_ERROR(get_logger(), "Exception during frame publishing: %s", e.what());
     }
   }
-}
-
-void
-CameraNode::postParameterChange(const std::vector<rclcpp::Parameter> &parameters)
-{
-  // check non-control parameters
-  for (const rclcpp::Parameter &parameter : parameters) {
-    if (parameter.get_name() == "jpeg_quality") {
-      jpeg_quality = parameter.get_parameter_value().get<uint8_t>();
-    }
-  }
-}
-
-#ifndef RCLCPP_HAS_PARAM_EXT_CB
-rcl_interfaces::msg::SetParametersResult
-CameraNode::onParameterChange(const std::vector<rclcpp::Parameter> &parameters)
-{
-  postParameterChange(parameters);
-
-  rcl_interfaces::msg::SetParametersResult result;
-  result.successful = true;
-  return result;
-}
-#endif
+};
 
 } // namespace camera
+
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(camera::MinimalCameraNode)
+
+// #include <atomic>
+// #include <chrono>
+// #include <fcntl.h>
+// #include <memory>
+// #include <mutex>
+// #include <string>
+// #include <sys/mman.h>
+// #include <sys/stat.h> // For stat() function
+// #include <thread>
+// #include <unistd.h>
+// #include <vector>
+
+// #include <camera_info_manager/camera_info_manager.hpp>
+// #include <rclcpp/rclcpp.hpp>
+// #include <sensor_msgs/msg/camera_info.hpp>
+// #include <sensor_msgs/msg/image.hpp>
+
+// #include <libcamera/camera.h>
+// #include <libcamera/camera_manager.h>
+// #include <libcamera/control_ids.h>
+// #include <libcamera/formats.h>
+// #include <libcamera/framebuffer_allocator.h>
+// #include <libcamera/property_ids.h>
+// #include <libcamera/request.h>
+// #include <libcamera/stream.h>
+
+// namespace camera
+// {
+
+// // Shared timestamp structure for hardware sync
+// struct alignas(64) time_stamp
+// {
+//   int64_t high;
+//   int64_t low;
+// };
+
+// class MinimalCameraNode : public rclcpp::Node
+// {
+// public:
+//   explicit MinimalCameraNode(const rclcpp::NodeOptions &options);
+//   ~MinimalCameraNode();
+
+// private:
+//   // LibCamera components
+//   libcamera::CameraManager camera_manager;
+//   std::shared_ptr<libcamera::Camera> camera;
+//   libcamera::Stream *stream;
+//   std::shared_ptr<libcamera::FrameBufferAllocator> allocator;
+//   std::vector<std::unique_ptr<libcamera::Request>> requests;
+
+//   // Buffer management
+//   struct buffer_info_t
+//   {
+//     void *data;
+//     size_t size;
+//   };
+//   std::unordered_map<const libcamera::FrameBuffer *, buffer_info_t> buffer_info;
+//   std::mutex buffer_mutex;
+
+//   // Image flipping
+//   bool flip_image = true;
+
+//   // Publishers
+//   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image;
+//   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_ci;
+
+//   // Camera info manager
+//   camera_info_manager::CameraInfoManager cim;
+
+//   // Timestamp handling
+//   time_stamp *pointt = (time_stamp *)MAP_FAILED;
+//   std::string timeshare_path;
+//   std::atomic<bool> running {false};
+
+//   // Exposure settings (configurable)
+//   const bool AE_ENABLE = false;
+//   const uint32_t EXPOSURE_TIME_US = 90000; // 90ms exposure in µs
+
+
+//   struct TimestampStats
+//   {
+//     int64_t first_hw_timestamp = 0;   // First hardware timestamp seen
+//     int64_t last_hw_timestamp = 0;    // Last hardware timestamp seen
+//     int64_t frame_count = 0;          // Total frames processed
+//     int64_t hw_timestamp_count = 0;   // Frames with hardware timestamps
+//     double max_timestamp_jump = 0.0;  // Maximum jump between consecutive timestamps (ms)
+//     double min_timestamp_jump = 1e9;  // Minimum jump between consecutive timestamps (ms)
+//     double sum_timestamp_jumps = 0.0; // Sum of all jumps for averaging
+//   } timestamp_stats;
+
+//   // Timer for periodic stats printing
+//   rclcpp::TimerBase::SharedPtr stats_timer;
+//   void
+//   printTimestampStats();
+
+
+//   // Methods
+//   void
+//   requestComplete(libcamera::Request *request);
+//   bool
+//   setupTimeshare();
+//   void
+//   flipRGB888Image(uint8_t *data, int width, int height, int step);
+// };
+
+// // Constructor
+// MinimalCameraNode::MinimalCameraNode(const rclcpp::NodeOptions &options)
+//     : Node("camera", options),
+//       cim(this)
+// {
+//   // Parameters
+//   const uint32_t width = declare_parameter<int64_t>("width", 1280);
+//   const uint32_t height = declare_parameter<int64_t>("height", 720);
+//   const libcamera::Size size {width, height};
+
+//   const std::string camera_id = declare_parameter<std::string>("camera", "");
+
+//   // Set up path to shared timestamp file
+//   const char *user_name = getlogin();
+//   timeshare_path = "/home/" + std::string(user_name) + "/timeshare";
+//   setupTimeshare();
+
+//   // Create publishers
+//   pub_image = create_publisher<sensor_msgs::msg::Image>("~/image_raw", 10);
+//   pub_ci = create_publisher<sensor_msgs::msg::CameraInfo>("~/camera_info", 10);
+
+//   RCLCPP_INFO(get_logger(), "Publishing to topics:");
+//   RCLCPP_INFO(get_logger(), "  - %s", pub_image->get_topic_name());
+//   RCLCPP_INFO(get_logger(), "  - %s", pub_ci->get_topic_name());
+
+//   // Set up camera manager
+//   RCLCPP_INFO(get_logger(), "Starting camera manager and looking for cameras...");
+//   camera_manager.start();
+
+//   if (camera_manager.cameras().empty()) {
+//     RCLCPP_ERROR(get_logger(), "No cameras detected by libcamera");
+//     throw std::runtime_error("No cameras available");
+//   }
+
+//   RCLCPP_INFO(get_logger(), "Found %zu camera(s):", camera_manager.cameras().size());
+//   for (const auto &cam : camera_manager.cameras()) {
+//     RCLCPP_INFO(get_logger(), "  - Camera ID: %s", cam->id().c_str());
+//   }
+
+//   // Get camera by ID or use the first one
+//   if (!camera_id.empty()) {
+//     RCLCPP_INFO(get_logger(), "Trying to use specified camera: %s", camera_id.c_str());
+//     camera = camera_manager.get(camera_id);
+//     if (!camera) {
+//       RCLCPP_ERROR(get_logger(), "Camera with ID '%s' not found", camera_id.c_str());
+//       throw std::runtime_error("Camera not found");
+//     }
+//   }
+//   else {
+//     camera = camera_manager.cameras().front();
+//     RCLCPP_INFO(get_logger(), "Using default camera: %s", camera->id().c_str());
+//   }
+
+//   if (camera->acquire()) {
+//     throw std::runtime_error("Failed to acquire camera");
+//   }
+
+//   // Configure camera for RGB888 stream
+//   RCLCPP_INFO(get_logger(), "Configuring camera with width=%d, height=%d, format=RGB888",
+//               size.width, size.height);
+
+//   std::unique_ptr<libcamera::CameraConfiguration> cfg =
+//     camera->generateConfiguration({libcamera::StreamRole::Viewfinder});
+
+//   if (!cfg) {
+//     RCLCPP_ERROR(get_logger(), "Failed to generate camera configuration");
+//     throw std::runtime_error("Failed to generate configuration");
+//   }
+
+//   libcamera::StreamConfiguration &scfg = cfg->at(0);
+//   RCLCPP_INFO(get_logger(), "Default configuration: %s", scfg.toString().c_str());
+
+//   // Set our desired format
+//   scfg.pixelFormat = libcamera::formats::RGB888;
+//   scfg.size = size;
+
+//   // Validate configuration
+//   auto validation_status = cfg->validate();
+//   if (validation_status == libcamera::CameraConfiguration::Invalid) {
+//     RCLCPP_ERROR(get_logger(), "Invalid camera configuration");
+//     throw std::runtime_error("Invalid camera configuration");
+//   }
+//   else if (validation_status == libcamera::CameraConfiguration::Adjusted) {
+//     RCLCPP_WARN(get_logger(), "Stream configuration adjusted to: %s", scfg.toString().c_str());
+//   }
+
+//   if (camera->configure(cfg.get()) < 0) {
+//     RCLCPP_ERROR(get_logger(), "Failed to apply camera configuration");
+//     throw std::runtime_error("Failed to configure camera");
+//   }
+
+//   RCLCPP_INFO(get_logger(), "Camera successfully configured with %s stream", scfg.toString().c_str());
+
+//   // Set up camera info manager
+//   std::string cname = camera->id() + '_' + scfg.size.toString();
+//   const auto &props = camera->properties();
+//   if (auto model = props.get(libcamera::properties::Model)) {
+//     cname = model.value() + '_' + cname;
+//   }
+
+//   // Clean camera name
+//   for (auto &c : cname) {
+//     if (!std::isalnum(c))
+//       c = '_';
+//   }
+
+//   cim.setCameraName(cname);
+//   const std::string &camera_info_url = declare_parameter<std::string>("camera_info_url", "");
+//   if (!cim.loadCameraInfo(camera_info_url)) {
+//     RCLCPP_WARN(get_logger(), "Failed to load camera calibration from URL");
+//   }
+
+//   // Allocate buffers
+//   stream = scfg.stream();
+//   allocator = std::make_shared<libcamera::FrameBufferAllocator>(camera);
+//   allocator->allocate(stream);
+
+//   // Create requests
+//   for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : allocator->buffers(stream)) {
+//     std::unique_ptr<libcamera::Request> request = camera->createRequest();
+//     if (!request) {
+//       throw std::runtime_error("Failed to create request");
+//     }
+
+//     // Map buffer memory
+//     size_t buffer_length = 0;
+//     int fd = -1;
+//     for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
+//       buffer_length = std::max<size_t>(buffer_length, plane.offset + plane.length);
+//       if (fd == -1) {
+//         fd = plane.fd.get();
+//       }
+//     }
+
+//     void *data = mmap(nullptr, buffer_length, PROT_READ, MAP_SHARED, fd, 0);
+//     if (data == MAP_FAILED) {
+//       throw std::runtime_error("mmap failed");
+//     }
+//     buffer_info[buffer.get()] = {data, buffer_length};
+
+//     if (request->addBuffer(stream, buffer.get()) < 0) {
+//       throw std::runtime_error("Failed to set buffer for request");
+//     }
+
+//     requests.push_back(std::move(request));
+//   }
+
+//   // Register callback
+//   camera->requestCompleted.connect(this, &MinimalCameraNode::requestComplete);
+
+//   // Start camera with initial controls
+//   libcamera::ControlList controls;
+//   controls.set(libcamera::controls::AeEnable, AE_ENABLE);
+//   controls.set(libcamera::controls::ExposureTime, EXPOSURE_TIME_US);
+
+//   RCLCPP_INFO(get_logger(), "Setting camera exposure: AE_ENABLE=%s, EXPOSURE_TIME_US=%u",
+//               AE_ENABLE ? "true" : "false", EXPOSURE_TIME_US);
+
+//   RCLCPP_INFO(get_logger(), "Starting camera capture...");
+//   if (camera->start(&controls)) {
+//     RCLCPP_ERROR(get_logger(), "Failed to start camera");
+//     throw std::runtime_error("Failed to start camera");
+//   }
+
+//   RCLCPP_INFO(get_logger(), "Camera started successfully");
+//   running = true;
+
+//   // Queue all requests
+//   for (std::unique_ptr<libcamera::Request> &request : requests) {
+//     camera->queueRequest(request.get());
+//   }
+
+//   stats_timer = create_wall_timer(
+//     std::chrono::seconds(10),
+//     std::bind(&MinimalCameraNode::printTimestampStats, this));
+// }
+
+// // Destructor
+// MinimalCameraNode::~MinimalCameraNode()
+// {
+//   running = false;
+
+//   if (camera) {
+//     camera->stop();
+//     allocator->free(stream);
+//     allocator.reset();
+//     camera->release();
+//     camera.reset();
+//   }
+
+//   camera_manager.stop();
+
+//   // Clean up memory mapped buffers
+//   for (const auto &e : buffer_info) {
+//     if (munmap(e.second.data, e.second.size) == -1) {
+//       RCLCPP_ERROR(get_logger(), "munmap failed");
+//     }
+//   }
+
+//   // Clean up timeshare mapping
+//   if (pointt != (time_stamp *)MAP_FAILED) {
+//     if (munmap(pointt, sizeof(time_stamp)) == -1) {
+//       RCLCPP_ERROR(get_logger(), "munmap failed for timeshare");
+//     }
+//   }
+// }
+
+// // Flip RGB888 image vertically and horizontally
+// void
+// MinimalCameraNode::flipRGB888Image(uint8_t *data, int width, int height, int step)
+// {
+//   // Create a temporary buffer for a single row
+//   std::vector<uint8_t> temp_row(step);
+
+//   // Flip vertically (swap rows from top and bottom)
+//   for (int y = 0; y < height / 2; y++) {
+//     uint8_t *top_row = data + y * step;
+//     uint8_t *bottom_row = data + (height - 1 - y) * step;
+
+//     // Swap entire rows
+//     memcpy(temp_row.data(), top_row, step);
+//     memcpy(top_row, bottom_row, step);
+//     memcpy(bottom_row, temp_row.data(), step);
+//   }
+
+//   // Flip horizontally (RGB pixels within each row)
+//   for (int y = 0; y < height; y++) {
+//     uint8_t *row = data + y * step;
+//     for (int x = 0; x < width / 2; x++) {
+//       // Swap RGB values (3 bytes per pixel)
+//       std::swap(row[x * 3], row[(width - 1 - x) * 3]);         // R
+//       std::swap(row[x * 3 + 1], row[(width - 1 - x) * 3 + 1]); // G
+//       std::swap(row[x * 3 + 2], row[(width - 1 - x) * 3 + 2]); // B
+//     }
+//   }
+// }
+
+// void
+// MinimalCameraNode::requestComplete(libcamera::Request *request)
+// {
+//   if (request->status() == libcamera::Request::RequestComplete) {
+//     // Check if there are any subscribers before processing
+//     bool has_raw_subscribers = pub_image->get_subscription_count() > 0;
+//     bool has_camera_info_subscribers = pub_ci->get_subscription_count() > 0;
+
+//     // Get buffer and metadata
+//     const libcamera::FrameBuffer *buffer = request->findBuffer(stream);
+//     const libcamera::FrameMetadata &metadata = buffer->metadata();
+
+//     // Get camera timestamp from metadata (in ns)
+//     int64_t camera_timestamp_ns = 0;
+//     for (const auto &plane : metadata.planes()) {
+//       if (plane.bytesused > 0) {
+//         camera_timestamp_ns = metadata.timestamp;
+//         break;
+//       }
+//     }
+
+//     // Debug output for frames
+//     static int frame_count = 0;
+//     frame_count++;
+
+//     // Current system time for comparison
+//     rclcpp::Time system_time = this->now();
+//     int64_t system_time_ns = system_time.nanoseconds();
+
+//     // Hardware timestamp from shared memory
+//     int64_t hw_timestamp_ns = 0;
+//     bool hw_timestamp_valid = false;
+
+//     if (pointt != (time_stamp *)MAP_FAILED) {
+//       hw_timestamp_ns = pointt->low;
+//       hw_timestamp_valid = (hw_timestamp_ns != 0);
+
+//       // For debug: read directly from file periodically
+//       if (frame_count % 100 == 1) {
+//         int fd = open(timeshare_path.c_str(), O_RDONLY);
+//         if (fd >= 0) {
+//           time_stamp buffer;
+//           if (read(fd, &buffer, sizeof(time_stamp)) == sizeof(time_stamp)) {
+//             RCLCPP_INFO(get_logger(), "Direct file read - high: %ld, low: %ld",
+//                         buffer.high, buffer.low);
+//           }
+//           close(fd);
+//         }
+//       }
+//     }
+
+//     // Prepare header and timestamp
+//     std_msgs::msg::Header hdr;
+//     hdr.frame_id = "camera";
+//     const libcamera::StreamConfiguration &cfg = stream->configuration();
+
+//     // Format the LiDAR HW timestamp properly for ROS messages
+//     if (hw_timestamp_valid) {
+//       // Convert to ROS time:
+//       // The LiDAR puts nanoseconds since Unix epoch in pointt->low
+//       // This is exactly what ROS2 expects for its time representation
+//       hdr.stamp.sec = hw_timestamp_ns / 1000000000;
+//       hdr.stamp.nanosec = hw_timestamp_ns % 1000000000;
+
+//       // Track timestamp differences for debugging
+//       static int64_t last_hw_timestamp = 0;
+//       if (last_hw_timestamp > 0) {
+//         double time_diff_ms = (hw_timestamp_ns - last_hw_timestamp) / 1000000.0;
+//         if (std::abs(time_diff_ms - 100.0) > 10.0) {
+//           RCLCPP_WARN(get_logger(), "[Frame %d] Unusual timestamp jump: %.2f ms between HW timestamps",
+//                       frame_count, time_diff_ms);
+//         }
+//       }
+//       last_hw_timestamp = hw_timestamp_ns;
+//     }
+//     else if (camera_timestamp_ns > 0) {
+//       // Fall back to camera timestamp if available
+//       hdr.stamp.sec = camera_timestamp_ns / 1000000000;
+//       hdr.stamp.nanosec = camera_timestamp_ns % 1000000000;
+//     }
+//     else {
+//       // Last resort is system time
+//       hdr.stamp = system_time;
+//     }
+
+//     double hw_sec = hw_timestamp_valid ? (hw_timestamp_ns / 1.0e9) : 0.0;
+//     double camera_sec = camera_timestamp_ns / 1.0e9;
+//     double system_sec = system_time_ns / 1.0e9;
+
+//     // Publish data if there are subscribers
+//     if (has_raw_subscribers || has_camera_info_subscribers) {
+//       // Publish raw image if there are subscribers
+//       if (has_raw_subscribers) {
+//         auto msg_img = std::make_unique<sensor_msgs::msg::Image>();
+//         msg_img->header = hdr;
+//         msg_img->width = cfg.size.width;
+//         msg_img->height = cfg.size.height;
+//         msg_img->step = cfg.stride;
+//         msg_img->encoding = "rgb8";
+//         msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
+
+//         msg_img->data.resize(buffer_info[buffer].size);
+//         memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
+
+//         if (flip_image) {
+//           flipRGB888Image(msg_img->data.data(), cfg.size.width, cfg.size.height, cfg.stride);
+//         }
+
+//         pub_image->publish(std::move(msg_img));
+//       }
+
+//       // Publish camera info if there are subscribers
+//       if (has_camera_info_subscribers) {
+//         sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
+//         ci.header = hdr;
+//         pub_ci->publish(ci);
+//       }
+//     }
+//   }
+//   else {
+//     RCLCPP_WARN(get_logger(), "Request returned with status: %d", (int)request->status());
+//   }
+
+//   // Queue the request again with the same control values
+//   request->reuse(libcamera::Request::ReuseBuffers);
+//   request->controls().set(libcamera::controls::AeEnable, AE_ENABLE);
+//   request->controls().set(libcamera::controls::ExposureTime, EXPOSURE_TIME_US);
+//   camera->queueRequest(request);
+// }
+
+// bool
+// MinimalCameraNode::setupTimeshare()
+// {
+//   RCLCPP_INFO(get_logger(), "Setting up timeshare at path: %s", timeshare_path.c_str());
+
+//   // Clean up previous mapping if it exists
+//   if (pointt != (time_stamp *)MAP_FAILED) {
+//     munmap(pointt, sizeof(time_stamp));
+//     pointt = (time_stamp *)MAP_FAILED;
+//   }
+
+//   // Try to open the timeshare file
+//   int fd = open(timeshare_path.c_str(), O_RDWR);
+//   if (fd < 0) {
+//     RCLCPP_ERROR(get_logger(), "Could not open timeshare file %s: %s",
+//                  timeshare_path.c_str(), strerror(errno));
+//     RCLCPP_INFO(get_logger(), "Will use system time for timestamps");
+//     return false;
+//   }
+
+//   // Check if file exists and is appropriate size
+//   struct stat file_stat;
+//   if (fstat(fd, &file_stat) < 0) {
+//     RCLCPP_WARN(get_logger(), "Could not get timeshare file stats: %s", strerror(errno));
+//   }
+//   else {
+//     RCLCPP_INFO(get_logger(), "Timeshare file size: %ld bytes", file_stat.st_size);
+
+//     // The file is likely a sparse file with holes. For sparse files, st_size might report
+//     // a smaller size than what's needed for mapping the full time_stamp structure.
+//     // We'll accept as long as there's enough space for the "low" timestamp (8 bytes)
+//     if (file_stat.st_size < 16) { // Minimum size needed for high and low values
+//       RCLCPP_ERROR(get_logger(),
+//                    "Timeshare file size too small: %ld bytes (expected at least 16 bytes)",
+//                    file_stat.st_size);
+//       close(fd);
+//       return false;
+//     }
+//   }
+
+//   // Map the shared memory
+//   pointt = (time_stamp *)mmap(NULL, sizeof(time_stamp), PROT_READ | PROT_WRITE,
+//                               MAP_SHARED, fd, 0);
+//   close(fd); // File descriptor can be closed after mapping
+
+//   if (pointt == (time_stamp *)MAP_FAILED) {
+//     RCLCPP_ERROR(get_logger(), "mmap failed for timeshare file: %s", strerror(errno));
+//     return false;
+//   }
+
+//   // Output initial timestamp values
+//   RCLCPP_INFO(get_logger(), "Successfully mapped timeshare file for hardware synchronization");
+//   RCLCPP_INFO(get_logger(), "Initial timeshare values - high: %ld, low: %ld",
+//               pointt->high, pointt->low);
+
+//   // Convert the LiDAR timestamp to a human-readable date for verification
+//   if (pointt->low != 0) {
+//     time_t seconds = pointt->low / 1000000000;
+//     char time_buf[32];
+//     struct tm tm_info;
+
+//     // Convert to local time
+//     localtime_r(&seconds, &tm_info);
+//     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+
+//     RCLCPP_INFO(get_logger(), "LiDAR timestamp in human-readable form: %s.%09ld",
+//                 time_buf, pointt->low % 1000000000);
+
+//     // Compare to system time
+//     auto current_time = this->now();
+//     seconds = current_time.seconds();
+//     localtime_r(&seconds, &tm_info);
+//     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+
+//     RCLCPP_INFO(get_logger(), "System time in human-readable form: %s.%09ld",
+//                 time_buf, current_time.nanoseconds() % 1000000000);
+
+//     double diff_seconds = std::abs(double(pointt->low) / 1.0e9 - double(current_time.nanoseconds()) / 1.0e9);
+//     RCLCPP_INFO(get_logger(), "Time difference between LiDAR and system: %.3f seconds", diff_seconds);
+
+//     if (diff_seconds > 3600) {
+//       RCLCPP_WARN(get_logger(), "LiDAR and system times differ by more than an hour!");
+//       RCLCPP_WARN(get_logger(), "This may indicate different time epochs are being used.");
+//     }
+//   }
+//   else {
+//     RCLCPP_WARN(get_logger(), "Initial LiDAR timestamp is zero. Waiting for LiDAR to update timestamp...");
+//   }
+
+//   return true;
+// }
+// } // namespace camera
+
+// #include <rclcpp_components/register_node_macro.hpp>
+// RCLCPP_COMPONENTS_REGISTER_NODE(camera::MinimalCameraNode)

@@ -1,85 +1,112 @@
 from ament_index_python.resources import has_resource
-
-from launch.actions import DeclareLaunchArgument
-from launch.launch_description import LaunchDescription
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
-
-from launch_ros.actions import ComposableNodeContainer
-from launch_ros.descriptions import ComposableNode
-
+from launch_ros.actions import Node
+import os
 
 def generate_launch_description() -> LaunchDescription:
     """
-    Generate a launch description with for the camera node and a visualiser.
+    Generate a launch description for dual camera capture with HD quality and RGB888 format.
+    Each camera runs in its own process to avoid the 'Multiple IPAManager objects are not allowed' error.
 
     Returns
     -------
-        LaunchDescription: the launch description
-
+    LaunchDescription: the launch description
     """
-    # parameters
-    camera_param_name = "camera"
-    camera_param_default = str(0)
-    camera_param = LaunchConfiguration(
-        camera_param_name,
-        default=camera_param_default,
-    )
-    camera_launch_arg = DeclareLaunchArgument(
-        camera_param_name,
-        default_value=camera_param_default,
-        description="camera ID or name"
+    # Common parameters for both cameras
+    format_param = "RGB888"
+    width_param = 1280
+    height_param = 720
+    pkg_share = get_package_share_directory('camera_ros')
+
+    # Define camera IDs - order based on libcamera-hello --list-cameras output
+    # cam0_id = "/base/soc/i2c0mux/i2c@1/imx477@1a"  # Camera 0 in the list
+    cam1_id = "/base/soc/i2c0mux/i2c@0/imx477@1a"  # Camera 1 in the list
+
+    # cam0_calib_file = os.path.join(pkg_share, 'config', 'cam0_calib.yaml')
+    cam1_calib_file = os.path.join(pkg_share, 'config', 'cam1_calib.yaml')
+
+
+    # Create standalone nodes (not composable)
+    # camera0_node = Node(
+    #     package='camera_ros',
+    #     executable='camera_node',
+    #     namespace='cam0',
+    #     name='camera0',
+    #     output='screen',  # Add this to see output from this node
+    #     parameters=[{
+    #         "camera": cam0_id,
+    #         'camera_info_url': 'file://' + cam0_calib_file,
+    #         "width": width_param,
+    #         "height": height_param,
+    #         "format": format_param,
+    #         "trigger_enable": True,
+    #         # "AeEnable": False,
+    #         # "ExposureTime": 1500
+    #     }],
+    #     remappings=[
+    #         # Make sure topics are properly namespaced
+    #         ('~/image_raw', '/cam0/image_raw'),
+    #         ('~/camera_info', '/cam0/camera_info')
+    #     ],
+    # )
+
+    camera1_node = Node(
+        package='camera_ros',
+        executable='camera_node',
+        namespace='cam1',
+        name='camera1',
+        output='screen',  # Add this to see output from this node
+        parameters=[{
+            "camera": cam1_id,
+            'camera_info_url': 'file://' + cam1_calib_file,
+            "width": width_param,
+            "height": height_param,
+            "format": format_param,
+            "trigger_enable": True,
+                        "log_level": "debug"
+
+            # "AeEnable": False,
+            # "ExposureTime": 1500
+        }],
+        remappings=[
+            # Make sure topics are properly namespaced
+            ('~/image_raw', '/cam1/image_raw'),
+            ('~/camera_info', '/cam1/camera_info')
+        ],
     )
 
-    format_param_name = "format"
-    format_param_default = str()
-    format_param = LaunchConfiguration(
-        format_param_name,
-        default=format_param_default,
-    )
-    format_launch_arg = DeclareLaunchArgument(
-        format_param_name,
-        default_value=format_param_default,
-        description="pixel format"
-    )
-
-    # camera node
-    composable_nodes = [
-        ComposableNode(
-            package='camera_ros',
-            plugin='camera::CameraNode',
-            parameters=[{
-                "camera": camera_param,
-                "width": 640,
-                "height": 480,
-                "format": format_param,
-            }],
-            extra_arguments=[{'use_intra_process_comms': True}],
-        ),
-
-    ]
-
-    # optionally add ImageViewNode to show camera image
+    # Optional image viewer nodes
+    viewer_nodes = []
     if has_resource("packages", "image_view"):
-        composable_nodes += [
-            ComposableNode(
+        viewer_nodes = [
+            Node(
                 package='image_view',
-                plugin='image_view::ImageViewNode',
-                remappings=[('/image', '/camera/image_raw')],
-                extra_arguments=[{'use_intra_process_comms': True}],
+                executable='image_view',
+                namespace='cam0',
+                name='image_view0',
+                remappings=[('image', 'image_raw')],
+            ),
+            Node(
+                package='image_view',
+                executable='image_view',
+                namespace='cam1',
+                name='image_view1',
+                remappings=[('image', 'image_raw')],
             ),
         ]
 
-    # composable nodes in single container
-    container = ComposableNodeContainer(
-        name='camera_container',
-        namespace='',
-        package='rclcpp_components',
-        executable='component_container',
-        composable_node_descriptions=composable_nodes,
-    )
+    # Helpful logging actions
+    log_actions = [
+        LogInfo(msg="Starting dual camera nodes with hardware trigger enabled"),
+    ]
 
+    # Return the launch description
     return LaunchDescription([
-        container,
-        camera_launch_arg,
-        format_launch_arg,
+        *log_actions,
+        # camera0_node,
+        camera1_node,
+        *viewer_nodes,
     ])
